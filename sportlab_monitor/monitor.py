@@ -170,7 +170,18 @@ def cmd_bacheca():
 
 def _loop_telegram():
     global _tg_offset
-    log.info("Telegram polling avviato")
+    if not TELEGRAM_TOKEN:
+        log.warning("TELEGRAM_TOKEN mancante — polling disabilitato")
+        return
+    # Rimuove webhook attivo (altrimenti getUpdates non riceve nulla)
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook",
+            timeout=10,
+        )
+        log.info("Webhook eliminato — polling attivo")
+    except Exception as e:
+        log.warning(f"deleteWebhook fallito: {e}")
     while True:
         try:
             r = requests.get(
@@ -183,16 +194,18 @@ def _loop_telegram():
                 testo = upd.get("message", {}).get("text", "").strip()
                 if not testo:
                     continue
-                log.info(f"Comando ricevuto: {testo}")
-                if testo == "/gare":
+                # Normalizza: rimuove "@nomebot" e rende minuscolo
+                cmd = testo.split("@")[0].lower()
+                log.info(f"Comando ricevuto: {testo!r} → {cmd!r}")
+                if cmd == "/gare":
                     cmd_gare()
-                elif testo.startswith("/segui"):
-                    parti = testo.split()
+                elif cmd.startswith("/segui"):
+                    parti = cmd.split()
                     if len(parti) == 2 and parti[1].isdigit():
                         cmd_segui(int(parti[1]))
                     else:
                         tg_send("Usa: /segui <numero>")
-                elif testo == "/bacheca":
+                elif cmd == "/bacheca":
                     cmd_bacheca()
         except Exception as e:
             log.error(f"Telegram polling error: {e}")
