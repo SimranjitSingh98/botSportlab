@@ -105,6 +105,17 @@ def tg_send(testo):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
+def tg_send_lungo(testo):
+    MAX = 4000
+    while len(testo) > MAX:
+        split = testo.rfind("\n", 0, MAX)
+        if split == -1:
+            split = MAX
+        tg_send(testo[:split])
+        testo = testo[split:].lstrip("\n")
+    if testo.strip():
+        tg_send(testo)
+
 # ── Comandi Telegram ──────────────────────────────────────────────────────────
 
 def normalizza_url(url):
@@ -117,6 +128,44 @@ def _url_completo(href):
         return "https://" + href
     return href
 
+def estrai_gare(html):
+    soup = BeautifulSoup(html, "html.parser")
+    gare = {}
+    numero = 1
+    sezione_corrente = "Generale"
+    for tag in soup.find_all(["b", "a"]):
+        if tag.name == "b":
+            t = tag.get_text(strip=True)
+            if t:
+                sezione_corrente = t
+        elif tag.name == "a":
+            href = tag.get("href", "")
+            if "rollergames.it" not in href or "index.htm" not in href:
+                continue
+            url = href.replace("/media/../corsa/", "/corsa/")
+            if not url.startswith("http"):
+                url = "https://attivita.rollergames.it" + url
+            # Il nome gara è nel testo del nodo padre PRIMA del tag <a>
+            nome = ""
+            parent = tag.parent
+            if parent:
+                testi = []
+                for child in parent.children:
+                    if child == tag:
+                        break
+                    if hasattr(child, "get_text"):
+                        t = child.get_text(strip=True)
+                        if t:
+                            testi.append(t)
+                    elif isinstance(child, str) and child.strip():
+                        testi.append(child.strip())
+                nome = " ".join(testi).strip()
+            if not nome:
+                nome = sezione_corrente
+            gare[numero] = {"nome": nome, "url": url, "sezione": sezione_corrente}
+            numero += 1
+    return gare
+
 def cmd_gare():
     global _gare_disponibili
     log.info("Inizio handler /gare — sto per scaricare FISR")
@@ -126,30 +175,22 @@ def cmd_gare():
     if not html:
         tg_send("❌ Impossibile scaricare la lista da FISR.\nUsa /segui <URL> per impostare direttamente l'URL della gara.")
         return
-    soup = BeautifulSoup(html, "html.parser")
-    _gare_disponibili = {}
-    n = 0
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        if "rollergames.it" not in href or not href.rstrip("/").endswith("index.htm"):
-            continue
-        url = normalizza_url(_url_completo(href))
-        nome = a.get_text(strip=True)
-        if not nome:
-            b = a.find("b") or (a.parent.find("b") if a.parent else None)
-            nome = b.get_text(strip=True) if b else ""
-        if not nome:
-            nome = a.parent.get_text(strip=True)[:80] if a.parent else url
-        n += 1
-        _gare_disponibili[n] = (nome, url)
+    log.info("/gare — inizio parsing")
+    _gare_disponibili = estrai_gare(html)
+    log.info(f"/gare — trovati {len(_gare_disponibili)} link")
     if not _gare_disponibili:
-        tg_send("_Nessuna gara trovata._\nUsa /segui <URL> per impostare direttamente l'URL.")
+        log.warning(f"/gare — HTML preview: {html[:1000]}")
+        tg_send(f"❌ Parser non trova link. HTML preview:\n`{html[:500]}`")
         return
+    log.info("/gare — costruisco messaggio")
     lines = ["📋 *Gare disponibili 2025/26:*", ""]
-    for num, (nome, _) in _gare_disponibili.items():
-        lines.append(f"{num}. {nome}")
+    for num, info in _gare_disponibili.items():
+        lines.append(f"{num}. {info['nome']}")
     lines += ["", "Rispondi con /segui <numero> per monitorare quella gara"]
-    tg_send("\n".join(lines))
+    messaggio = "\n".join(lines)
+    log.info(f"/gare — messaggio lungo {len(messaggio)} caratteri, invio...")
+    tg_send_lungo(messaggio)
+    log.info("/gare — DONE")
 
 def cmd_segui(arg):
     global URL_INDEX, URL_BASE, _snapshot
@@ -161,7 +202,8 @@ def cmd_segui(arg):
         if numero not in _gare_disponibili:
             tg_send("❌ Numero non valido. Usa /gare per vedere la lista.")
             return
-        nome, url = _gare_disponibili[numero]
+        info = _gare_disponibili[numero]
+        nome, url = info["nome"], info["url"]
     else:
         tg_send("Usa: /segui <numero> oppure /segui <URL>")
         return
