@@ -132,17 +132,22 @@ def _leggi_risultati(soup, titolo):
     sezioni = []
     for tbl in soup.find_all("table"):
         rows = tbl.find_all("tr")
-        if len(rows) < 3:
+        if len(rows) < 2:
             continue
-        headers = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
         righe = []
-        for row in rows[1:]:
-            celle = [td.get_text(strip=True) for td in row.find_all("td")]
+        for row in rows:
+            celle = [td.get_text(" ", strip=True) for td in row.find_all("td")]
             if not any(celle):
                 continue
-            righe.append({"celle": celle, "sportlab": cerca_atleta(" ".join(celle))})
+            # Salta righe header: la prima cella deve essere un numero (posizione)
+            try:
+                int(celle[0])
+            except (ValueError, IndexError):
+                continue
+            nome = celle[2] if len(celle) > 2 else ""
+            righe.append({"celle": celle, "sportlab": cerca_atleta(nome)})
         if righe:
-            sezioni.append({"headers": headers, "righe": righe})
+            sezioni.append({"righe": righe})
     return {"titolo": titolo, "tipo": "risultati", "sezioni": sezioni}
 
 # ── Formattazione messaggi ────────────────────────────────────────────────────
@@ -183,25 +188,33 @@ def formatta_messaggio(cat_label, label_gara, gara, url_gara):
 
     elif tipo == "risultati":
         for tab in sezioni:
-            sl_righe = [(i + 1, r) for i, r in enumerate(tab["righe"]) if r["sportlab"]]
+            sl_righe = [r for r in tab["righe"] if r["sportlab"]]
 
             if sl_righe:
                 lines.append("🏆 *Atleti Sport Lab:*")
-                for _, riga in sl_righe:
+                for riga in sl_righe:
                     celle = riga["celle"]
-                    pos  = celle[0] if celle else "?"
-                    nome = riga["sportlab"]["nome"]
-                    lines.append(f"  • *{nome}*  →  {pos}° posto")
+                    pos   = celle[0] if celle else "?"
+                    nome  = riga["sportlab"]["nome"]
+                    tempo = celle[5] if len(celle) > 5 else ""
+                    tempo_str = f"  —  {tempo}" if tempo else ""
+                    lines.append(f"  • *{nome}*  →  {pos}°{tempo_str}")
                 lines.append("")
 
             lines.append("📊 *Classifica:*")
             for riga in tab["righe"]:
                 celle = riga["celle"]
-                parti = [c for c in celle if c]
-                pos   = parti[0].rjust(3) if parti else "  ?"
+                pos   = celle[0].rjust(3) if len(celle) > 0 else "  ?"
+                nome  = celle[2]           if len(celle) > 2 else ""
+                soc   = celle[4]           if len(celle) > 4 else ""
+                tempo = celle[5]           if len(celle) > 5 else ""
                 star  = " ★" if riga["sportlab"] else "  "
-                resto = "  ".join(parti[1:]) if len(parti) > 1 else ""
-                lines.append(f"  {pos}.{star}{resto}")
+                line  = f"  {pos}.{star}{nome}"
+                if soc:
+                    line += f"  —  {soc}"
+                if tempo:
+                    line += f"  —  {tempo}"
+                lines.append(line)
             lines.append("")
 
     else:
