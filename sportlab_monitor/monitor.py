@@ -232,28 +232,126 @@ def estrai_live(html):
         numero += 1
     return live
 
-# ── Contenuto bacheca live ────────────────────────────────────────────────────
+# ── Parser bacheca live ───────────────────────────────────────────────────────
 
-def estrai_contenuto_bacheca(html):
+def parse_bacheca(html):
+    """
+    Analizza una pagina bacheca_virtuale (index o race file).
+    Ritorna (titolo_gara, sezioni, snapshot) dove:
+      sezioni  = [{"titolo", "emoji", "righe": [str], "sportlab": [atleta]}]
+      snapshot = {titolo: testo_grezzo_righe}  — usato per il diff tabella x tabella
+    """
     soup = BeautifulSoup(html, "html.parser")
-    lines = []
+
+    titolo_gara = ""
     h3 = soup.find("h3")
     if h3:
-        lines.append(h3.get_text(" ", strip=True))
-        lines.append("")
-    for bold in soup.find_all("b"):
-        ul = bold.find_next_sibling("ul")
-        if not ul:
+        titolo_gara = h3.get_text(" ", strip=True)
+
+    sezioni  = []
+    snapshot = {}
+
+    for tbl in soup.find_all("table"):
+        rows = tbl.find_all("tr")
+        if len(rows) < 2:
             continue
-        cat = bold.get_text(strip=True)
-        if cat:
-            lines.append(f"*{cat}*")
-        for li in ul.find_all("li"):
-            t = li.get_text(" ", strip=True)
-            if t:
-                lines.append(f"  • {t}")
+
+        # Cerca titolo nel tag <b>/<strong> precedente
+        titolo = ""
+        prev = tbl.find_previous_sibling()
+        while prev:
+            if not hasattr(prev, "name"):
+                break
+            if prev.name in ("b", "strong"):
+                t = prev.get_text(strip=True)
+                if t and len(t) > 2:
+                    titolo = t
+                    break
+            elif prev.name in ("h3", "h4", "p"):
+                t = prev.get_text(strip=True)
+                if t and len(t) > 2:
+                    titolo = t
+                    break
+            else:
+                break
+            prev = prev.find_previous_sibling()
+
+        righe_fmt  = []
+        testi_snap = []
+        atleti_sl  = []
+
+        for row in rows:
+            celle = [td.get_text(" ", strip=True) for td in row.find_all("td")]
+            if not any(c.strip() for c in celle):
+                continue
+            try:
+                n = int(celle[0])
+            except (ValueError, IndexError):
+                continue  # header o riga vuota
+
+            if len(celle) >= 6:
+                # Classifica: pos | bib | nome | cod | soc | tempo
+                nome    = celle[2] if len(celle) > 2 else ""
+                soc     = abbrevia_societa(celle[4]) if len(celle) > 4 else ""
+                tempo   = celle[5].strip() if len(celle) > 5 else ""
+                pos_str = _MEDAGLIE.get(n, f"{n}.")
+            else:
+                # Batteria: bib | (spacer) | nome | cod | soc
+                nome    = celle[2] if len(celle) > 2 else ""
+                soc     = abbrevia_societa(celle[4]) if len(celle) > 4 else ""
+                tempo   = ""
+                pos_str = ""
+
+            if not nome.strip():
+                continue
+
+            atleta    = cerca_atleta(nome)
+            soc_str   = f" ({soc})" if soc else ""
+            tempo_str = f" — {tempo}" if tempo else ""
+
+            if atleta:
+                atleti_sl.append(atleta)
+                corpo = f"*{nome}*{soc_str}{tempo_str} ✅"
+                righe_fmt.append(f"  👉 {pos_str} {corpo}".strip())
+            else:
+                corpo = f"{nome}{soc_str}{tempo_str}"
+                righe_fmt.append(f"  {pos_str} {corpo}".strip() if pos_str else f"  {corpo}")
+
+            testi_snap.append(" | ".join(c for c in celle if c))
+
+        if righe_fmt:
+            tit   = titolo or f"Sezione {len(sezioni)+1}"
+            emoji = "📊" if any(k in tit.lower() for k in ("classifica", "risultat")) else "📋"
+            sezioni.append({"titolo": tit, "emoji": emoji, "righe": righe_fmt, "sportlab": atleti_sl})
+            snapshot[tit] = "\n".join(testi_snap)
+
+    # Fallback per index.php (struttura UL/LI, nessuna tabella dati)
+    if not sezioni:
+        for bold in soup.find_all("b"):
+            ul = bold.find_next_sibling("ul")
+            if not ul:
+                continue
+            cat = bold.get_text(strip=True)
+            if not cat:
+                continue
+            righe = [f"  • {li.get_text(' ', strip=True)}" for li in ul.find_all("li") if li.get_text(strip=True)]
+            if righe:
+                sezioni.append({"titolo": cat, "emoji": "📋", "righe": righe, "sportlab": []})
+                snapshot[cat] = ul.get_text(" ", strip=True)
+
+    return titolo_gara, sezioni, snapshot
+
+def _formatta_bacheca_completa(titolo_gara, sezioni, url):
+    lines = []
+    if titolo_gara:
+        lines += [titolo_gara, ""]
+    for s in sezioni:
+        lines.append(f"{s['emoji']} *{s['titolo']}*")
+        lines.extend(s["righe"])
         lines.append("")
-    return "\n".join(lines).strip() or soup.get_text(" ", strip=True)[:1500]
+    if url:
+        lines.append(f"[🔗 Apri bacheca live]({url})")
+    return "\n".join(lines).strip()
 
 # ── Loop bacheca live ─────────────────────────────────────────────────────────
 
@@ -266,23 +364,35 @@ def _loop_bacheca():
             _live_prossimo_check = datetime.now()
             html = scarica(_url_bacheca)
             if html:
-                testo = BeautifulSoup(html, "html.parser").get_text(" ")
+                _, sezioni, nuovo_snap = parse_bacheca(html)
+
                 if _bacheca_snapshot is None:
-                    _bacheca_snapshot = testo
-                    log.info("Bacheca live: prima scansione")
-                elif testo != _bacheca_snapshot:
-                    _bacheca_snapshot = testo
+                    # Riavvio senza snapshot: imposta senza inviare
+                    _bacheca_snapshot = nuovo_snap
+                    log.info("Bacheca live: snapshot iniziale nel loop")
+                elif nuovo_snap != _bacheca_snapshot:
                     _live_ultimo_aggiornamento = datetime.now()
-                    ora_str   = _live_ultimo_aggiornamento.strftime("%H:%M:%S")
-                    contenuto = estrai_contenuto_bacheca(html)
-                    msg = (
-                        f"📡 *AGGIORNAMENTO LIVE* — {ora_str}\n"
-                        f"{_bacheca_nome}\n\n"
-                        f"{contenuto}\n\n"
-                        f"[🔗 Apri bacheca live]({_url_bacheca})"
-                    )
-                    tg_send_lungo(msg)
-                    log.info(f"Bacheca live aggiornamento inviato ({ora_str})")
+                    ora_str = _live_ultimo_aggiornamento.strftime("%H:%M:%S")
+
+                    cambiate = [
+                        s for s in sezioni
+                        if _bacheca_snapshot.get(s["titolo"]) != nuovo_snap.get(s["titolo"])
+                    ]
+                    _bacheca_snapshot = nuovo_snap
+
+                    if cambiate:
+                        lines = [f"🔔 *AGGIORNAMENTO LIVE* — {ora_str}", ""]
+                        for s in cambiate:
+                            if s["sportlab"]:
+                                lines.append(f"{s['emoji']} *{s['titolo']}*")
+                                lines.extend(s["righe"])
+                            else:
+                                lines.append(f"{s['emoji']} Aggiornato: {s['titolo']} — nessun atleta Sport Lab")
+                            lines.append("")
+                        lines.append(f"[🔗 Apri bacheca live]({_url_bacheca})")
+                        tg_send_lungo("\n".join(lines))
+                        log.info(f"Bacheca live: {len(cambiate)} sezioni aggiornate ({ora_str})")
+
             for _ in range(INTERVALLO_LIVE):
                 if _url_bacheca is None:
                     break
@@ -378,16 +488,34 @@ def cmd_seguilive(arg, chat_id):
     else:
         tg_send("Usa: /seguilive <numero> oppure /seguilive <URL>", chat_id=chat_id)
         return
-    _url_bacheca      = url
-    _bacheca_nome     = nome
-    _bacheca_snapshot = None
+
+    _url_bacheca  = url
+    _bacheca_nome = nome
     salva_stato()
+
+    # Download + invio sincrono immediato
+    tg_send("⏳ Carico bacheca live...", chat_id=chat_id)
+    html = scarica(url)
+    if html:
+        ora_str = datetime.now().strftime("%H:%M:%S")
+        titolo_gara, sezioni, snap = parse_bacheca(html)
+        _bacheca_snapshot = snap
+        msg = (
+            f"📡 *LIVE ATTIVATO* — {ora_str}\n"
+            f"{nome}\n\n"
+            f"{_formatta_bacheca_completa(titolo_gara, sezioni, url)}"
+        )
+        tg_send_lungo(msg, chat_id=chat_id)
+        log.info(f"Live attivato: snapshot iniziale con {len(snap)} sezioni")
+    else:
+        _bacheca_snapshot = None
+        tg_send("⚠️ Impossibile scaricare la bacheca ora. Il loop riproverà ogni 30s.", chat_id=chat_id)
+
     _avvia_loop_bacheca()
     log.info(f"Live avviato: {url}")
     tg_send(
         f"📡 Ora seguo LIVE: *{nome}*\n"
-        f"Aggiornamento ogni {INTERVALLO_LIVE} secondi.\n"
-        f"Usa /stoplive per fermare.",
+        f"Aggiornamento ogni {INTERVALLO_LIVE}s — Usa /stoplive per fermare.",
         chat_id=chat_id
     )
 
