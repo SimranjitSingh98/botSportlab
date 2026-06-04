@@ -2,7 +2,12 @@ import requests
 import time
 import unicodedata
 import logging
+import re
+import os
+import json
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from bs4 import BeautifulSoup
 
 logging.basicConfig(
@@ -12,11 +17,10 @@ logging.basicConfig(
 )
 log = logging.getLogger()
 
-URL_BASE   = "https://attivita.rollergames.it/corsa/rrunn/2026/631083/RW00007.1/"
-URL_INDEX  = URL_BASE + "index.htm"
+URL_BASE   = "https://attivita.rollergames.it/corsa/bacheca_virtuale/segretari/630840/"
+URL_INDEX  = URL_BASE + "index.php"
 INTERVALLO = 90
 
-import os
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "867997198")
 
@@ -40,23 +44,22 @@ ATLETI = [
 _snapshot = {}
 
 def ora():
-    return datetime.now().strftime("%H:%M:%S")
+    return datetime.now().strftime("%H:%M")
 
 def norm(t):
     t = unicodedata.normalize("NFD", t.upper())
     return "".join(c for c in t if unicodedata.category(c) != "Mn")
 
-def cerca_atleti(testo):
+def cerca_atleta(testo):
     n = norm(testo)
-    trovati = []
     for a in ATLETI:
         match = sum(1 for k in a["chiavi"] if norm(k) in n)
         if match >= 2:
-            trovati.append(a)
-    return trovati
+            return a
+    return None
 
 def prefisso_file(href):
-    nome = href.split("/")[-1].upper()
+    nome = href.split("fn=")[-1].upper() if "fn=" in href else href.split("/")[-1].upper()
     for pref in CATEGORIE_NOSTRE:
         if nome.startswith(pref):
             return pref
@@ -84,62 +87,149 @@ def tg_send(testo):
     except Exception as e:
         log.error(f"Telegram error: {e}")
 
+# ── Parser ────────────────────────────────────────────────────────────────────
+
 def leggi_gara(html):
     soup = BeautifulSoup(html, "html.parser")
+    testo = soup.get_text(" ").lower()
+    h3 = soup.find("h3")
+    titolo = h3.get_text(" ", strip=True) if h3 else ""
+    if "ordine di partenza" in testo:
+        return _leggi_batterie(soup, titolo)
+    if "classifica" in testo or "risultat" in testo:
+        return _leggi_risultati(soup, titolo)
+    return {"titolo": titolo, "tipo": "sconosciuto", "sezioni": []}
+
+def _leggi_batterie(soup, titolo):
+    batterie = []
+    for elem in soup.find_all(["b", "strong"]):
+        m = re.search(r"batteria\s+n\.?\s*(\d+)", elem.get_text(strip=True), re.IGNORECASE)
+        if not m:
+            continue
+        num = int(m.group(1))
+        tbl = elem.find_next("table")
+        if not tbl:
+            continue
+        atleti = []
+        for row in tbl.find_all("tr"):
+            celle = [td.get_text(strip=True) for td in row.find_all("td")]
+            if len(celle) >= 3 and celle[2].strip():
+                atleti.append({
+                    "bib":      celle[0],
+                    "nome":     celle[2],
+                    "societa":  celle[4] if len(celle) > 4 else "",
+                    "sportlab": cerca_atleta(celle[2]),
+                })
+        if atleti:
+            batterie.append({
+                "numero":   num,
+                "atleti":   atleti,
+                "sportlab": [a for a in atleti if a["sportlab"]],
+            })
+    return {"titolo": titolo, "tipo": "batterie", "sezioni": batterie}
+
+def _leggi_risultati(soup, titolo):
     sezioni = []
     for tbl in soup.find_all("table"):
         rows = tbl.find_all("tr")
-        if len(rows) < 2:
+        if len(rows) < 3:
             continue
-        titolo = "Tabella"
-        prev = tbl.find_previous_sibling()
-        while prev:
-            if prev.name in ["b","strong","h1","h2","h3","h4","h5","p","font"]:
-                t = prev.get_text(strip=True)
-                if len(t) > 2:
-                    titolo = t
-                    break
-            prev = prev.find_previous_sibling()
-        headers = [c.get_text(strip=True) for c in rows[0].find_all(["th","td"])]
-        dati = []
+        headers = [c.get_text(strip=True) for c in rows[0].find_all(["th", "td"])]
+        righe = []
         for row in rows[1:]:
             celle = [td.get_text(strip=True) for td in row.find_all("td")]
-            if any(celle):
-                dati.append(celle)
-        atleti = cerca_atleti(tbl.get_text(" "))
-        sezioni.append({"titolo": titolo, "headers": headers, "dati": dati, "atleti": atleti})
-    return sezioni
+            if not any(celle):
+                continue
+            righe.append({"celle": celle, "sportlab": cerca_atleta(" ".join(celle))})
+        if righe:
+            sezioni.append({"headers": headers, "righe": righe})
+    return {"titolo": titolo, "tipo": "risultati", "sezioni": sezioni}
 
-def formatta_messaggio(cat_label, label_gara, sezioni, url_gara, novita=False):
-    prefisso = "🔔 *AGGIORNAMENTO*" if novita else "📥 *Prima scansione*"
-    lines = [prefisso, f"*{cat_label} — {label_gara}*", f"🕐 {ora()}", ""]
-    if not sezioni:
-        lines.append("_Pagina ancora vuota._")
-    else:
-        for s in sezioni:
-            lines.append(f"📋 *{s['titolo']}*")
-            if s["dati"]:
-                headers = s["headers"]
-                for riga in s["dati"][:10]:
-                    if headers:
-                        parti = [f"{headers[i]}: {riga[i]}" for i in range(min(len(headers), len(riga))) if riga[i]]
-                        lines.append("  " + " | ".join(parti))
-                    else:
-                        lines.append("  " + " | ".join(c for c in riga if c))
-                if len(s["dati"]) > 10:
-                    lines.append(f"  _...e altri {len(s['dati'])-10} righe_")
-            else:
-                lines.append("  _Nessun dato ancora._")
-            if s["atleti"]:
-                lines.append("")
-                lines.append("✅ *Atleti Sport Lab:*")
-                for a in s["atleti"]:
-                    lines.append(f"  • *{a['nome']}* — {a['categoria']}")
-            else:
-                lines.append("  ℹ️ _Nessun atleta Sport Lab._")
+# ── Formattazione messaggi ────────────────────────────────────────────────────
+
+def formatta_messaggio(cat_label, label_gara, gara, url_gara):
+    tipo    = gara.get("tipo", "sconosciuto")
+    sezioni = gara.get("sezioni", [])
+
+    lines = [
+        f"*{cat_label} — {label_gara}*",
+        f"🕐 {ora()}",
+        "",
+    ]
+
+    if tipo == "batterie":
+        batterie_sl = [b for b in sezioni if b["sportlab"]]
+
+        if not batterie_sl:
+            lines.append("👟 _Nessun atleta Sport Lab in queste batterie._")
+        else:
+            lines.append("👟 *Atleti Sport Lab:*")
+            for bat in batterie_sl:
+                for a in bat["sportlab"]:
+                    lines.append(f"  • {a['nome']}  →  Batteria {bat['numero']}")
             lines.append("")
-    lines.append(f"[Apri pagina]({url_gara})")
+
+            for bat in batterie_sl:
+                lines.append(f"🏁 *Batteria {bat['numero']}*")
+                for a in bat["atleti"]:
+                    bib  = a["bib"].rjust(3)
+                    nome = a["nome"]
+                    soc  = a["societa"]
+                    if a["sportlab"]:
+                        lines.append(f"  {bib}  *{nome}* ★  {soc}")
+                    else:
+                        lines.append(f"  {bib}  {nome}  {soc}")
+                lines.append("")
+
+    elif tipo == "risultati":
+        for tab in sezioni:
+            sl_righe = [(i + 1, r) for i, r in enumerate(tab["righe"]) if r["sportlab"]]
+
+            if sl_righe:
+                lines.append("🏆 *Atleti Sport Lab:*")
+                for _, riga in sl_righe:
+                    celle = riga["celle"]
+                    pos  = celle[0] if celle else "?"
+                    nome = riga["sportlab"]["nome"]
+                    lines.append(f"  • *{nome}*  →  {pos}° posto")
+                lines.append("")
+
+            lines.append("📊 *Classifica:*")
+            for riga in tab["righe"]:
+                celle = riga["celle"]
+                parti = [c for c in celle if c]
+                pos   = parti[0].rjust(3) if parti else "  ?"
+                star  = " ★" if riga["sportlab"] else "  "
+                resto = "  ".join(parti[1:]) if len(parti) > 1 else ""
+                lines.append(f"  {pos}.{star}{resto}")
+            lines.append("")
+
+    else:
+        lines.append("_Pagina in aggiornamento..._")
+        lines.append("")
+
+    lines.append(f"[🔗 Apri pagina]({url_gara})")
     return "\n".join(lines)
+
+# ── HTTP server (Render health check) ────────────────────────────────────────
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            body = json.dumps({"status": "ok", "time": ora()}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+# ── Index e loop principale ───────────────────────────────────────────────────
 
 def get_links(html_index):
     soup = BeautifulSoup(html_index, "html.parser")
@@ -152,7 +242,8 @@ def get_links(html_index):
             href = a.get("href", "")
             pref = prefisso_file(href)
             if pref:
-                links.append((URL_BASE + href, CATEGORIE_NOSTRE[pref], a.get_text(strip=True)))
+                full_url = URL_BASE + href if not href.startswith("http") else href
+                links.append((full_url, CATEGORIE_NOSTRE[pref], a.get_text(strip=True)))
     return links
 
 def controlla():
@@ -170,24 +261,25 @@ def controlla():
         if not html_gara:
             continue
         testo = BeautifulSoup(html_gara, "html.parser").get_text(" ")
-        prev = _snapshot.get(url_gara)
+        prev  = _snapshot.get(url_gara)
         _snapshot[url_gara] = testo
-        sezioni = leggi_gara(html_gara)
+        gara  = leggi_gara(html_gara)
         if prev is None:
             log.info(f"Prima scansione: {cat_label} — {label_gara}")
-            tg_send(formatta_messaggio(cat_label, label_gara, sezioni, url_gara, novita=False))
+            tg_send(formatta_messaggio(cat_label, label_gara, gara, url_gara))
         elif testo != prev:
             log.info(f"AGGIORNAMENTO: {cat_label} — {label_gara}")
-            tg_send(formatta_messaggio(cat_label, label_gara, sezioni, url_gara, novita=True))
+            tg_send(formatta_messaggio(cat_label, label_gara, gara, url_gara))
         else:
             log.info(f"Nessuna modifica: {cat_label} — {label_gara}")
 
-def main():
-    log.info("=" * 50)
-    log.info("MONITOR CAMPIONATI ITALIANI 2026 — Sport Lab SA")
-    log.info(f"Intervallo: {INTERVALLO}s | Atleti: {len(ATLETI)}")
-    log.info("=" * 50)
-    tg_send(f"✅ *Monitor Sport Lab avviato!*\nCategorie: RAF, RAM, R1F, R1M\nIntervallo: ogni {INTERVALLO}s\n🕐 {ora()}")
+def _loop_monitoraggio():
+    tg_send(
+        f"✅ *Monitor Sport Lab avviato!*\n"
+        f"Categorie: RAF, RAM, R1F, R1M\n"
+        f"Intervallo: ogni {INTERVALLO}s\n"
+        f"🕐 {ora()}"
+    )
     while True:
         try:
             controlla()
@@ -195,6 +287,21 @@ def main():
             log.error(f"Errore inatteso: {e}")
             tg_send(f"⚠️ Errore inatteso: {e}")
         time.sleep(INTERVALLO)
+
+def main():
+    log.info("=" * 50)
+    log.info("MONITOR CAMPIONATI ITALIANI 2026 — Sport Lab SA")
+    log.info(f"Intervallo: {INTERVALLO}s | Atleti: {len(ATLETI)}")
+    log.info("=" * 50)
+
+    porta = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", porta), HealthHandler)
+    log.info(f"HTTP server in ascolto su porta {porta}")
+
+    t = threading.Thread(target=_loop_monitoraggio, daemon=True)
+    t.start()
+
+    server.serve_forever()
 
 if __name__ == "__main__":
     main()
