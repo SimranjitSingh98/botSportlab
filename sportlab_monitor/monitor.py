@@ -92,29 +92,34 @@ def scarica_fisr(url):
         log.error(f"Errore download FISR {url}: {e}")
         return None
 
-def tg_send(testo):
+def tg_send(testo, chat_id=None):
+    cid = chat_id or TELEGRAM_CHAT_ID
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_TOKEN non impostato")
-        return
+        return None
+    log.info(f"tg_send — chat_id={cid}, lunghezza={len(testo)}")
     try:
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": testo, "parse_mode": "Markdown"},
+            json={"chat_id": cid, "text": testo, "parse_mode": "Markdown"},
             timeout=10
         )
+        log.info(f"tg_send — status={resp.status_code}, risposta={resp.text[:200]}")
+        return resp
     except Exception as e:
-        log.error(f"Telegram error: {e}")
+        log.error(f"tg_send — ERRORE: {e}")
+        return None
 
-def tg_send_lungo(testo):
+def tg_send_lungo(testo, chat_id=None):
     MAX = 4000
     while len(testo) > MAX:
         split = testo.rfind("\n", 0, MAX)
         if split == -1:
             split = MAX
-        tg_send(testo[:split])
+        tg_send(testo[:split], chat_id=chat_id)
         testo = testo[split:].lstrip("\n")
     if testo.strip():
-        tg_send(testo)
+        tg_send(testo, chat_id=chat_id)
 
 # ── Comandi Telegram ──────────────────────────────────────────────────────────
 
@@ -166,21 +171,21 @@ def estrai_gare(html):
             numero += 1
     return gare
 
-def cmd_gare():
+def cmd_gare(chat_id):
     global _gare_disponibili
     log.info("Inizio handler /gare — sto per scaricare FISR")
-    tg_send("⏳ Scarico lista gare da FISR...")
+    tg_send("⏳ Scarico lista gare da FISR...", chat_id=chat_id)
     html = scarica_fisr(FISR_URL)
     log.info(f"/gare — html scaricato: {len(html) if html else 'None'} caratteri")
     if not html:
-        tg_send("❌ Impossibile scaricare la lista da FISR.\nUsa /segui <URL> per impostare direttamente l'URL della gara.")
+        tg_send("❌ Impossibile scaricare la lista da FISR.\nUsa /segui <URL> per impostare direttamente l'URL della gara.", chat_id=chat_id)
         return
     log.info("/gare — inizio parsing")
     _gare_disponibili = estrai_gare(html)
     log.info(f"/gare — trovati {len(_gare_disponibili)} link")
     if not _gare_disponibili:
         log.warning(f"/gare — HTML preview: {html[:1000]}")
-        tg_send(f"❌ Parser non trova link. HTML preview:\n`{html[:500]}`")
+        tg_send(f"❌ Parser non trova link. HTML preview:\n`{html[:500]}`", chat_id=chat_id)
         return
     log.info("/gare — costruisco messaggio")
     lines = ["📋 *Gare disponibili 2025/26:*", ""]
@@ -189,10 +194,10 @@ def cmd_gare():
     lines += ["", "Rispondi con /segui <numero> per monitorare quella gara"]
     messaggio = "\n".join(lines)
     log.info(f"/gare — messaggio lungo {len(messaggio)} caratteri, invio...")
-    tg_send_lungo(messaggio)
+    tg_send_lungo(messaggio, chat_id=chat_id)
     log.info("/gare — DONE")
 
-def cmd_segui(arg):
+def cmd_segui(arg, chat_id):
     global URL_INDEX, URL_BASE, _snapshot
     if arg.startswith("http"):
         url  = normalizza_url(arg)
@@ -200,23 +205,23 @@ def cmd_segui(arg):
     elif arg.isdigit():
         numero = int(arg)
         if numero not in _gare_disponibili:
-            tg_send("❌ Numero non valido. Usa /gare per vedere la lista.")
+            tg_send("❌ Numero non valido. Usa /gare per vedere la lista.", chat_id=chat_id)
             return
         info = _gare_disponibili[numero]
         nome, url = info["nome"], info["url"]
     else:
-        tg_send("Usa: /segui <numero> oppure /segui <URL>")
+        tg_send("Usa: /segui <numero> oppure /segui <URL>", chat_id=chat_id)
         return
     URL_INDEX = url
     URL_BASE  = url.rsplit("/", 1)[0] + "/"
     _snapshot = {}
     log.info(f"URL aggiornato: {URL_INDEX}")
-    tg_send(f"✅ Ora monitoro: *{nome}*\nURL: {url}")
+    tg_send(f"✅ Ora monitoro: *{nome}*\nURL: {url}", chat_id=chat_id)
 
-def cmd_bacheca():
+def cmd_bacheca(chat_id):
     html = scarica_fisr(FISR_URL)
     if not html:
-        tg_send("❌ Impossibile scaricare la pagina.")
+        tg_send("❌ Impossibile scaricare la pagina.", chat_id=chat_id)
         return
     soup = BeautifulSoup(html, "html.parser")
     trovate = []
@@ -229,12 +234,12 @@ def cmd_bacheca():
             nome = a.parent.get_text(strip=True)[:80]
         trovate.append((nome or url, url))
     if not trovate:
-        tg_send("_Nessuna bacheca virtuale trovata._")
+        tg_send("_Nessuna bacheca virtuale trovata._", chat_id=chat_id)
         return
     lines = ["🖥 *Bacheca virtuale:*", ""]
     for nome, url in trovate:
         lines.append(f"[{nome}]({url})")
-    tg_send("\n".join(lines))
+    tg_send("\n".join(lines), chat_id=chat_id)
 
 def _loop_telegram():
     global _tg_offset
@@ -259,23 +264,24 @@ def _loop_telegram():
             )
             for upd in r.json().get("result", []):
                 _tg_offset = upd["update_id"] + 1
-                testo = upd.get("message", {}).get("text", "").strip()
+                msg   = upd.get("message", {})
+                testo = msg.get("text", "").strip()
                 if not testo:
                     continue
+                chat_id = str(msg.get("chat", {}).get("id", TELEGRAM_CHAT_ID))
                 # Primo token normalizzato per il match del comando
                 cmd = testo.split()[0].split("@")[0].lower()
-                log.info(f"Comando ricevuto: {testo!r} → {cmd!r}")
+                log.info(f"Comando ricevuto: {testo!r} → {cmd!r} (chat_id={chat_id})")
                 if cmd == "/gare":
-                    cmd_gare()
+                    cmd_gare(chat_id=chat_id)
                 elif cmd == "/segui":
-                    # Usa testo originale per preservare maiuscole/URL
                     parti = testo.split(None, 1)
                     if len(parti) == 2:
-                        cmd_segui(parti[1].strip())
+                        cmd_segui(parti[1].strip(), chat_id=chat_id)
                     else:
-                        tg_send("Usa: /segui <numero> oppure /segui <URL>")
+                        tg_send("Usa: /segui <numero> oppure /segui <URL>", chat_id=chat_id)
                 elif cmd == "/bacheca":
-                    cmd_bacheca()
+                    cmd_bacheca(chat_id=chat_id)
         except Exception as e:
             log.error(f"Telegram polling error: {e}")
             time.sleep(5)
@@ -345,76 +351,73 @@ def _leggi_risultati(soup, titolo):
 
 # ── Formattazione messaggi ────────────────────────────────────────────────────
 
-def formatta_messaggio(cat_label, label_gara, gara, url_gara):
+_MEDAGLIE    = {1: "🥇", 2: "🥈", 3: "🥉"}
+_PREFISSI_SOC = {"ASD", "SSD", "APS", "APD", "POL", "ARL", "US", "GS", "SS", "AS", "POLVA", "ASDP"}
+
+def abbrevia_societa(soc):
+    soc = re.sub(r'\s*\([A-Z0-9]{1,4}\)\s*$', '', soc).strip()
+    parole = [p for p in soc.split() if p.replace(".", "").upper() not in _PREFISSI_SOC and p]
+    return " ".join(parole[:2]) if parole else soc[:15]
+
+def formatta_messaggio(cat_label, label_gara, gara, url_gara, novita=False):
     tipo    = gara.get("tipo", "sconosciuto")
     sezioni = gara.get("sezioni", [])
+    ora_str = datetime.now().strftime("%H:%M:%S")
+    prefisso = "🔔 *AGGIORNAMENTO*" if novita else "📥 *Prima scansione*"
 
     lines = [
-        f"*{cat_label} — {label_gara}*",
-        f"🕐 {ora()}",
+        f"{prefisso} — {ora_str}",
+        "",
+        f"🏁 *{cat_label} — {label_gara}*",
         "",
     ]
 
     if tipo == "batterie":
         batterie_sl = [b for b in sezioni if b["sportlab"]]
-
         if not batterie_sl:
-            lines.append("👟 _Nessun atleta Sport Lab in queste batterie._")
+            lines.append("_Nessun atleta Sport Lab in queste batterie._")
         else:
-            lines.append("👟 *Atleti Sport Lab:*")
             for bat in batterie_sl:
-                for a in bat["sportlab"]:
-                    lines.append(f"  • {a['nome']}  →  Batteria {bat['numero']}")
-            lines.append("")
-
-            for bat in batterie_sl:
-                lines.append(f"🏁 *Batteria {bat['numero']}*")
-                for a in bat["atleti"]:
-                    bib  = a["bib"].rjust(3)
+                lines.append(f"*Batteria {bat['numero']}*")
+                for i, a in enumerate(bat["atleti"], 1):
                     nome = a["nome"]
-                    soc  = a["societa"]
+                    soc  = abbrevia_societa(a["societa"])
+                    soc_str = f" ({soc})" if soc else ""
                     if a["sportlab"]:
-                        lines.append(f"  {bib}  *{nome}* ★  {soc}")
+                        lines.append(f"{i}. *{nome}*{soc_str} ✅")
                     else:
-                        lines.append(f"  {bib}  {nome}  {soc}")
+                        lines.append(f"{i}. {nome}{soc_str}")
                 lines.append("")
+            n_sl = sum(len(b["sportlab"]) for b in batterie_sl)
+            lines.append(f"✅ {n_sl} atleti Sport Lab in questa batteria")
 
     elif tipo == "risultati":
         for tab in sezioni:
-            sl_righe = [r for r in tab["righe"] if r["sportlab"]]
-
-            if sl_righe:
-                lines.append("🏆 *Atleti Sport Lab:*")
-                for riga in sl_righe:
-                    celle = riga["celle"]
-                    pos   = celle[0] if celle else "?"
-                    nome  = riga["sportlab"]["nome"]
-                    tempo = celle[5] if len(celle) > 5 else ""
-                    tempo_str = f"  —  {tempo}" if tempo else ""
-                    lines.append(f"  • *{nome}*  →  {pos}°{tempo_str}")
-                lines.append("")
-
-            lines.append("📊 *Classifica:*")
+            n_sl = sum(1 for r in tab["righe"] if r["sportlab"])
             for riga in tab["righe"]:
                 celle = riga["celle"]
-                pos   = celle[0].rjust(3) if len(celle) > 0 else "  ?"
-                nome  = celle[2]           if len(celle) > 2 else ""
-                soc   = celle[4]           if len(celle) > 4 else ""
-                tempo = celle[5]           if len(celle) > 5 else ""
-                star  = " ★" if riga["sportlab"] else "  "
-                line  = f"  {pos}.{star}{nome}"
-                if soc:
-                    line += f"  —  {soc}"
-                if tempo:
-                    line += f"  —  {tempo}"
-                lines.append(line)
-            lines.append("")
+                try:
+                    pos = int(celle[0])
+                except (ValueError, IndexError):
+                    continue
+                nome  = celle[2] if len(celle) > 2 else ""
+                soc   = abbrevia_societa(celle[4]) if len(celle) > 4 else ""
+                tempo = celle[5].strip() if len(celle) > 5 else ""
+                pos_str   = _MEDAGLIE.get(pos, f"{pos}.")
+                soc_str   = f" ({soc})" if soc else ""
+                tempo_str = f" — {tempo}" if tempo else ""
+                if riga["sportlab"]:
+                    lines.append(f"{pos_str} *{nome}*{soc_str}{tempo_str} ✅")
+                else:
+                    lines.append(f"{pos_str} {nome}{soc_str}{tempo_str}")
+            if n_sl:
+                lines.append("")
+                lines.append(f"✅ {n_sl} atleti Sport Lab in questa gara")
 
     else:
         lines.append("_Pagina in aggiornamento..._")
-        lines.append("")
 
-    lines.append(f"[🔗 Apri pagina]({url_gara})")
+    lines += ["", f"[🔗 Apri risultati]({url_gara})"]
     return "\n".join(lines)
 
 # ── HTTP server (Render health check) ────────────────────────────────────────
@@ -465,10 +468,10 @@ def controlla():
         gara  = leggi_gara(html_gara)
         if prev is None:
             log.info(f"Prima scansione: {cat_label} — {label_gara}")
-            tg_send(formatta_messaggio(cat_label, label_gara, gara, url_gara))
+            tg_send_lungo(formatta_messaggio(cat_label, label_gara, gara, url_gara, novita=False))
         elif testo != prev:
             log.info(f"AGGIORNAMENTO: {cat_label} — {label_gara}")
-            tg_send(formatta_messaggio(cat_label, label_gara, gara, url_gara))
+            tg_send_lungo(formatta_messaggio(cat_label, label_gara, gara, url_gara, novita=True))
         else:
             log.info(f"Nessuna modifica: {cat_label} — {label_gara}")
 
@@ -492,11 +495,20 @@ def main():
     log.info("MONITOR CAMPIONATI ITALIANI 2026 — Sport Lab SA")
     log.info(f"Intervallo: {INTERVALLO}s | Atleti: {len(ATLETI)}")
     log.info("=" * 50)
+    log.info(f"TELEGRAM_TOKEN presente: {bool(TELEGRAM_TOKEN)}, lunghezza: {len(TELEGRAM_TOKEN)}")
+    log.info(f"TELEGRAM_CHAT_ID: {TELEGRAM_CHAT_ID}")
 
     porta = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", porta), HealthHandler)
     log.info(f"HTTP server in ascolto su porta {porta}")
     threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def _test_telegram():
+        time.sleep(5)
+        log.info("TEST: invio messaggio Telegram di prova")
+        result = tg_send("✅ Test avvio — bot online")
+        log.info(f"TEST: risultato tg_send = {result}")
+    threading.Thread(target=_test_telegram, daemon=True).start()
 
     threading.Thread(target=_loop_monitoraggio, daemon=True).start()
     threading.Thread(target=_loop_telegram, daemon=True).start()
