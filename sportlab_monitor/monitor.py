@@ -4,7 +4,6 @@ import unicodedata
 import logging
 import re
 import os
-import json
 import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -228,16 +227,9 @@ def formatta_messaggio(cat_label, label_gara, gara, url_gara):
 
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        if self.path == "/health":
-            body = json.dumps({"status": "ok", "time": ora()}).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(body)
-        else:
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"OK")
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"SportLab Monitor attivo")
 
     def log_message(self, format, *args):
         pass
@@ -310,11 +302,12 @@ def main():
     porta = int(os.environ.get("PORT", 10000))
     server = HTTPServer(("0.0.0.0", porta), HealthHandler)
     log.info(f"HTTP server in ascolto su porta {porta}")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    t = threading.Thread(target=_loop_monitoraggio, daemon=True)
-    t.start()
+    threading.Thread(target=_loop_monitoraggio, daemon=True).start()
 
-    server.serve_forever()
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()
