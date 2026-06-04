@@ -40,7 +40,11 @@ ATLETI = [
     {"nome": "Pepe Lorenzo",         "categoria": "RAGAZZI 12 M", "chiavi": ["PEPE", "LORENZO"]},
 ]
 
-_snapshot = {}
+_snapshot         = {}
+_gare_disponibili = {}  # {numero: (nome, url)}
+_tg_offset        = 0
+
+FISR_URL = "https://www.fisr.info/attivita/corsa_risultati.php"
 
 def ora():
     return datetime.now().strftime("%H:%M")
@@ -85,6 +89,114 @@ def tg_send(testo):
         )
     except Exception as e:
         log.error(f"Telegram error: {e}")
+
+# ── Comandi Telegram ──────────────────────────────────────────────────────────
+
+def normalizza_url(url):
+    return url.replace("rollergames.it/media/../corsa/", "rollergames.it/corsa/")
+
+def _url_completo(href):
+    if href.startswith("//"):
+        return "https:" + href
+    if not href.startswith("http"):
+        return "https://" + href
+    return href
+
+def cmd_gare():
+    global _gare_disponibili
+    html = scarica(FISR_URL)
+    if not html:
+        tg_send("❌ Impossibile scaricare la lista gare.")
+        return
+    soup = BeautifulSoup(html, "html.parser")
+    _gare_disponibili = {}
+    n = 0
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if "rollergames.it" not in href or not href.rstrip("/").endswith("index.htm"):
+            continue
+        url = normalizza_url(_url_completo(href))
+        nome = a.get_text(strip=True)
+        if not nome:
+            b = a.find("b") or (a.parent.find("b") if a.parent else None)
+            nome = b.get_text(strip=True) if b else ""
+        if not nome:
+            nome = a.parent.get_text(strip=True)[:80] if a.parent else url
+        n += 1
+        _gare_disponibili[n] = (nome, url)
+    if not _gare_disponibili:
+        tg_send("_Nessuna gara trovata._")
+        return
+    lines = ["📋 *Gare disponibili 2025/26:*", ""]
+    for num, (nome, _) in _gare_disponibili.items():
+        lines.append(f"{num}. {nome}")
+    lines += ["", "Rispondi con /segui <numero> per monitorare quella gara"]
+    tg_send("\n".join(lines))
+
+def cmd_segui(numero):
+    global URL_INDEX, URL_BASE, _snapshot
+    if numero not in _gare_disponibili:
+        tg_send("❌ Numero non valido. Usa /gare per vedere la lista.")
+        return
+    nome, url = _gare_disponibili[numero]
+    URL_INDEX = url
+    URL_BASE  = url.rsplit("/", 1)[0] + "/"
+    _snapshot = {}
+    log.info(f"URL aggiornato: {URL_INDEX}")
+    tg_send(f"✅ Ora monitoro: *{nome}*\nURL: {url}")
+
+def cmd_bacheca():
+    html = scarica(FISR_URL)
+    if not html:
+        tg_send("❌ Impossibile scaricare la pagina.")
+        return
+    soup = BeautifulSoup(html, "html.parser")
+    trovate = []
+    for a in soup.find_all("a", href=True):
+        if "bacheca_virtuale" not in a["href"]:
+            continue
+        url = normalizza_url(_url_completo(a["href"]))
+        nome = a.get_text(strip=True)
+        if not nome and a.parent:
+            nome = a.parent.get_text(strip=True)[:80]
+        trovate.append((nome or url, url))
+    if not trovate:
+        tg_send("_Nessuna bacheca virtuale trovata._")
+        return
+    lines = ["🖥 *Bacheca virtuale:*", ""]
+    for nome, url in trovate:
+        lines.append(f"[{nome}]({url})")
+    tg_send("\n".join(lines))
+
+def _loop_telegram():
+    global _tg_offset
+    log.info("Telegram polling avviato")
+    while True:
+        try:
+            r = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": _tg_offset, "timeout": 30},
+                timeout=35,
+            )
+            for upd in r.json().get("result", []):
+                _tg_offset = upd["update_id"] + 1
+                testo = upd.get("message", {}).get("text", "").strip()
+                if not testo:
+                    continue
+                log.info(f"Comando ricevuto: {testo}")
+                if testo == "/gare":
+                    cmd_gare()
+                elif testo.startswith("/segui"):
+                    parti = testo.split()
+                    if len(parti) == 2 and parti[1].isdigit():
+                        cmd_segui(int(parti[1]))
+                    else:
+                        tg_send("Usa: /segui <numero>")
+                elif testo == "/bacheca":
+                    cmd_bacheca()
+        except Exception as e:
+            log.error(f"Telegram polling error: {e}")
+            time.sleep(5)
 
 # ── Parser ────────────────────────────────────────────────────────────────────
 
@@ -305,6 +417,7 @@ def main():
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
     threading.Thread(target=_loop_monitoraggio, daemon=True).start()
+    threading.Thread(target=_loop_telegram, daemon=True).start()
 
     while True:
         time.sleep(60)
