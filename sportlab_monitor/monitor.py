@@ -77,6 +77,21 @@ def scarica(url):
         log.error(f"Errore download {url}: {e}")
         return None
 
+def scarica_fisr(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+        "Referer": "https://www.fisr.info/",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        r.encoding = r.apparent_encoding
+        return r.text
+    except Exception as e:
+        log.error(f"Errore download FISR {url}: {e}")
+        return None
+
 def tg_send(testo):
     if not TELEGRAM_TOKEN:
         log.warning("TELEGRAM_TOKEN non impostato")
@@ -104,9 +119,12 @@ def _url_completo(href):
 
 def cmd_gare():
     global _gare_disponibili
-    html = scarica(FISR_URL)
+    log.info("Inizio handler /gare — sto per scaricare FISR")
+    tg_send("⏳ Scarico lista gare da FISR...")
+    html = scarica_fisr(FISR_URL)
+    log.info(f"/gare — html scaricato: {len(html) if html else 'None'} caratteri")
     if not html:
-        tg_send("❌ Impossibile scaricare la lista gare.")
+        tg_send("❌ Impossibile scaricare la lista da FISR.\nUsa /segui <URL> per impostare direttamente l'URL della gara.")
         return
     soup = BeautifulSoup(html, "html.parser")
     _gare_disponibili = {}
@@ -125,7 +143,7 @@ def cmd_gare():
         n += 1
         _gare_disponibili[n] = (nome, url)
     if not _gare_disponibili:
-        tg_send("_Nessuna gara trovata._")
+        tg_send("_Nessuna gara trovata._\nUsa /segui <URL> per impostare direttamente l'URL.")
         return
     lines = ["📋 *Gare disponibili 2025/26:*", ""]
     for num, (nome, _) in _gare_disponibili.items():
@@ -133,12 +151,20 @@ def cmd_gare():
     lines += ["", "Rispondi con /segui <numero> per monitorare quella gara"]
     tg_send("\n".join(lines))
 
-def cmd_segui(numero):
+def cmd_segui(arg):
     global URL_INDEX, URL_BASE, _snapshot
-    if numero not in _gare_disponibili:
-        tg_send("❌ Numero non valido. Usa /gare per vedere la lista.")
+    if arg.startswith("http"):
+        url  = normalizza_url(arg)
+        nome = url
+    elif arg.isdigit():
+        numero = int(arg)
+        if numero not in _gare_disponibili:
+            tg_send("❌ Numero non valido. Usa /gare per vedere la lista.")
+            return
+        nome, url = _gare_disponibili[numero]
+    else:
+        tg_send("Usa: /segui <numero> oppure /segui <URL>")
         return
-    nome, url = _gare_disponibili[numero]
     URL_INDEX = url
     URL_BASE  = url.rsplit("/", 1)[0] + "/"
     _snapshot = {}
@@ -146,7 +172,7 @@ def cmd_segui(numero):
     tg_send(f"✅ Ora monitoro: *{nome}*\nURL: {url}")
 
 def cmd_bacheca():
-    html = scarica(FISR_URL)
+    html = scarica_fisr(FISR_URL)
     if not html:
         tg_send("❌ Impossibile scaricare la pagina.")
         return
@@ -194,17 +220,18 @@ def _loop_telegram():
                 testo = upd.get("message", {}).get("text", "").strip()
                 if not testo:
                     continue
-                # Normalizza: rimuove "@nomebot" e rende minuscolo
-                cmd = testo.split("@")[0].lower()
+                # Primo token normalizzato per il match del comando
+                cmd = testo.split()[0].split("@")[0].lower()
                 log.info(f"Comando ricevuto: {testo!r} → {cmd!r}")
                 if cmd == "/gare":
                     cmd_gare()
-                elif cmd.startswith("/segui"):
-                    parti = cmd.split()
-                    if len(parti) == 2 and parti[1].isdigit():
-                        cmd_segui(int(parti[1]))
+                elif cmd == "/segui":
+                    # Usa testo originale per preservare maiuscole/URL
+                    parti = testo.split(None, 1)
+                    if len(parti) == 2:
+                        cmd_segui(parti[1].strip())
                     else:
-                        tg_send("Usa: /segui <numero>")
+                        tg_send("Usa: /segui <numero> oppure /segui <URL>")
                 elif cmd == "/bacheca":
                     cmd_bacheca()
         except Exception as e:
